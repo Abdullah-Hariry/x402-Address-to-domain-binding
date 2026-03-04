@@ -1,54 +1,36 @@
 require('dotenv').config();
 const { ethers } = require('ethers');
-const { Coinbase } = require('@coinbase/coinbase-sdk');
-const fs = require('fs');
 
 async function makePayment() {
   console.log('AI Agent starting payment request...\n');
-  
+
   // Step 1: Try to access the resource (will get 402)
   console.log('Requesting data from server...');
   const response = await fetch(`${process.env.SERVER_URL}/api/data`);
-  
+
   console.log(`Response status: ${response.status}`);
-  
+
   if (response.status === 402) {
-    const paymentDetails = await response.json();
-    
+    const paymentRequirements = await response.json();
+
     console.log('\nPayment Required:');
-    console.log(`   Pay to: ${paymentDetails.payTo}`);
-    console.log(`   Amount: ${paymentDetails.maxAmountRequired} (0.01 USDC)`);
-    console.log(`   Network: ${paymentDetails.network}`);
-    
-    // Step 2: Create wallet
+    console.log(`   Pay to: ${paymentRequirements.payTo}`);
+    console.log(`   Amount: ${paymentRequirements.amount} (0.01 USDC)`);
+    console.log(`   Network: ${paymentRequirements.network}`);
+
+    // Step 2: Set up wallet (signing only, no broadcasting)
     const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
     const wallet = new ethers.Wallet(process.env.CLIENT_PRIVATE_KEY, provider);
-    
     console.log(`Client wallet: ${wallet.address}`);
-    
-    const ethBalance = await provider.getBalance(wallet.address);
-    
-    // Fixed USDC contract creation
-    const usdcAbi = ['function balanceOf(address) view returns (uint256)'];
-    const usdc = new ethers.Contract(process.env.USDC_ADDRESS, usdcAbi, provider);
-    const usdcBalance = await usdc.balanceOf(wallet.address);
 
-    console.log('   ETH Balance:', ethers.formatEther(ethBalance), 'ETH');
-    console.log('   USDC Balance:', ethers.formatUnits(usdcBalance, 6), 'USDC');
-
-    if (usdcBalance < paymentDetails.maxAmountRequired) {
-      console.log('\nERROR: Insufficient USDC!');
-      return;
-    }
-    
-    // Step 3: Create EIP-712 payment authorization
+    // Step 3: Create EIP-712 authorization
     const domain = {
-      name: 'USDC',
-      version: '2',
+      name: paymentRequirements.extra.name,
+      version: paymentRequirements.extra.version,
       chainId: parseInt(process.env.CHAIN_ID),
-      verifyingContract: paymentDetails.asset
+      verifyingContract: paymentRequirements.asset
     };
-    
+
     const types = {
       TransferWithAuthorization: [
         { name: 'from', type: 'address' },
@@ -59,85 +41,71 @@ async function makePayment() {
         { name: 'nonce', type: 'bytes32' }
       ]
     };
-    
+
     const nonce = ethers.hexlify(ethers.randomBytes(32));
-    const value = {
+    const authorization = {
       from: wallet.address,
-      to: ethers.getAddress(paymentDetails.payTo),
-      value: paymentDetails.maxAmountRequired,
+      to: ethers.getAddress(paymentRequirements.payTo),
+      value: paymentRequirements.amount,
       validAfter: 0,
-      validBefore: Math.floor(Date.now() / 1000) + 3600,
-      nonce: nonce
+      validBefore: Math.floor(Date.now() / 1000) + paymentRequirements.maxTimeoutSeconds,
+      nonce
     };
-    
+
     console.log('\nCreating EIP-712 signature...');
-    const signature = await wallet.signTypedData(domain, types, value);
-    
+    const signature = await wallet.signTypedData(domain, types, authorization);
     console.log(`   Signature: ${signature.substring(0, 20)}...`);
-    console.log(`   Authorizing payment to: ${value.to}\n`);
-    
-    console.log('Sending authorization to Coinbase CDP...');
 
-    try {
-      // Initialize CDP
-      const credentials = JSON.parse(fs.readFileSync('./cdp-credentials.json', 'utf-8'));
-      Coinbase.configure({
-        apiKeyName: credentials.name,
-        privateKey: credentials.privateKey
-      });
+    // Step 4: Build x402 v2 payment payload
+    const paymentPayload = {
+      x402Version: 2,
+      resource: `${process.env.SERVER_URL}/api/data`,
+      accepted: paymentRequirements,
+      payload: {
+        authorization: {
+          from: authorization.from,
+          to: authorization.to,
+          value: String(authorization.value),
+          validAfter: String(authorization.validAfter),
+          validBefore: String(authorization.validBefore),
+          nonce: authorization.nonce
+        },
+        signature
+      }
+    };
 
-      console.log('CDP initialized');
-      console.log('Broadcasting transaction...');
+    const paymentHeader = Buffer.from(JSON.stringify(paymentPayload)).toString('base64');
 
-      const sig = ethers.Signature.from(signature);
+    console.log('\nSending payment authorization to server (facilitator flow)...');
 
-      const usdcWithSigner = new ethers.Contract(
-        process.env.USDC_ADDRESS, 
-        ['function transferWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, uint8 v, bytes32 r, bytes32 s) external'],
-        wallet
-      );
+    const paidResponse = await fetch(`${process.env.SERVER_URL}/api/data`, {
+      headers: { 'X-Payment': paymentHeader }
+    });
 
-      const tx = await usdcWithSigner.transferWithAuthorization(
-        value.from,
-        value.to,
-        value.value,
-        value.validAfter,
-        value.validBefore,
-        nonce,
-        sig.v,
-        sig.r,
-        sig.s
-      );  
+    if (paidResponse.ok) {
+      const data = await paidResponse.json();
+      const paymentResponse = paidResponse.headers.get('PAYMENT-RESPONSE');
 
-      console.log('Transaction hash:', tx.hash);
-      console.log('Basescan: https://sepolia.basescan.org/tx/' + tx.hash);
-
-      console.log('\nWaiting for blockchain confirmation...');
-      const receipt = await tx.wait();
-      console.log('Confirmed in block', receipt.blockNumber);
-
-      const paidResponse = await fetch(`${process.env.SERVER_URL}/api/data`, {
-        headers: {
-          'X-Payment-Tx': tx.hash
-        } 
-      });
-
-      if (paidResponse.ok) {
-        const data = await paidResponse.json();
-        console.log('\nSUCCESS: Received protected data');
-        console.log(data);
-        console.log('===============================================');
-        console.log('Transaction:', tx.hash);
-        console.log('Block:', receipt.blockNumber);
-        console.log('Payment: 0.01 USDC to', value.to);
-        console.log('===============================================\n');
+      let receipt = null;
+      if (paymentResponse) {
+        receipt = JSON.parse(Buffer.from(paymentResponse, 'base64').toString());
       }
 
-    } catch(error) {
-      console.log('\nERROR:', error.message);
+      console.log('\nSUCCESS: Received protected data');
+      console.log(data);
+      console.log('===============================================');
+      if (receipt) {
+        console.log('Transaction:', receipt.transaction);
+        console.log('Network:', receipt.network);
+        console.log('Payer:', receipt.payer);
+        console.log('Basescan: https://sepolia.basescan.org/tx/' + receipt.transaction);
+      }
+      console.log('===============================================\n');
+    } else {
+      const err = await paidResponse.json();
+      console.log('\nERROR:', err.error || err.reason || paidResponse.status);
     }
   }
 }
 
-// Run the client
 makePayment().catch(console.error);
